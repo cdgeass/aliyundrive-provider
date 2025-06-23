@@ -30,12 +30,15 @@ import androidx.core.content.edit
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import io.github.cdgeass.AliyunpanClient
 import io.github.cdgeass.aliyunpanprovider.ui.theme.AliyunpanProviderTheme
 import io.github.cdgeass.model.GetUserResponse
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 sealed class UiState {
     object Initial : UiState()
@@ -62,11 +65,13 @@ class MyViewModel(
     private val client = AliyunpanClient()
 
     init {
-        _refreshToken.value = getRefreshToken()
-        val authorization = getAuthorization()
+        _refreshToken.value = loadRefreshToken()
+        val authorization = loadAuthorization()
         if (_refreshToken.value != null && authorization != null) {
             _uiState.value = UiState.Verified
-            getUserInfo()
+            viewModelScope.launch {
+                loadUserInfo()
+            }
         } else {
             _uiState.value = UiState.Initial
         }
@@ -81,7 +86,7 @@ class MyViewModel(
         }
     }
 
-    fun getRefreshToken(): String? {
+    fun loadRefreshToken(): String? {
         return application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE)
             .getString(
                 "refreshToken",
@@ -89,7 +94,7 @@ class MyViewModel(
             )
     }
 
-    fun getAuthorization(): String? {
+    fun loadAuthorization(): String? {
         return application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE)
             .getString(
                 "authorization",
@@ -97,10 +102,12 @@ class MyViewModel(
             )
     }
 
-    fun setRefreshToken(refreshToken: String) {
+    suspend fun updateRefreshToken(refreshToken: String) {
         try {
             val getAccessTokenFuture = client.getAccessToken(refreshToken)
-            val getAccessTokenResponse = getAccessTokenFuture.get()
+            val getAccessTokenResponse = withContext(Dispatchers.IO) {
+                getAccessTokenFuture.get()
+            }
             val authorization = getAccessTokenResponse.authorization
 
             application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE).edit {
@@ -115,7 +122,7 @@ class MyViewModel(
             }
             _refreshToken.value = refreshToken
             _uiState.value = UiState.Verified
-            getUserInfo()
+            loadUserInfo()
         } catch (e: Exception) {
             Log.e("AliyunpanProvider", "setRefreshToken", e)
             _uiState.value = UiState.Error(e.message ?: "Unknown error")
@@ -132,12 +139,14 @@ class MyViewModel(
         _user.value = null
     }
 
-    fun getUserInfo() {
-        val authorization = getAuthorization()
+    suspend fun loadUserInfo() {
+        val authorization = loadAuthorization()
         if (authorization != null) {
             try {
                 val getUserFuture = client.getUser(authorization)
-                val userInfoResponse = getUserFuture.get()
+                val userInfoResponse = withContext(Dispatchers.IO) {
+                    getUserFuture.get()
+                }
                 _user.value = userInfoResponse
                 _uiState.value = UiState.Authorized
             } catch (e: Exception) {
@@ -205,7 +214,7 @@ fun SetRefreshToken(modifier: Modifier, viewModel: MyViewModel) {
                 Button(
                     onClick = {
                         coroutineScope.launch {
-                            viewModel.setRefreshToken(refreshTokenInput)
+                            viewModel.updateRefreshToken(refreshTokenInput)
                         }
                     }
                 ) {
@@ -220,8 +229,18 @@ fun SetRefreshToken(modifier: Modifier, viewModel: MyViewModel) {
             is UiState.Authorized -> {
                 val userInfo = viewModel.user
                 if (userInfo != null) {
-                    Text("User ID: ${userInfo.userId}")
-                    Text("Nick Name: ${userInfo.nickName}")
+                    Text(
+                        modifier = Modifier
+                            .padding(8.dp)
+                            .fillMaxWidth(),
+                        text = "User ID: ${userInfo.userId}"
+                    )
+                    Text(
+                        modifier = Modifier
+                            .padding(8.dp)
+                            .fillMaxWidth(),
+                        text = "Nick Name: ${userInfo.nickName}"
+                    )
                 } else {
                     Text("Loading user info...")
                 }
