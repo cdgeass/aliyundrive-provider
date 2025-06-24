@@ -175,6 +175,19 @@ class AliyunpanProvider : DocumentsProvider() {
         return result
     }
 
+    override fun isChildDocument(
+        parentDocumentId: String?,
+        documentId: String?
+    ): Boolean {
+        if (parentDocumentId == null) {
+            return false
+        }
+        if (documentId == null) {
+            return true
+        }
+        return documentId.startsWith(parentDocumentId)
+    }
+
     override fun openDocument(
         documentId: String?,
         mode: String?,
@@ -184,17 +197,20 @@ class AliyunpanProvider : DocumentsProvider() {
 
         val cacheDir = context?.cacheDir
         val tempFile = File.createTempFile(documentId!!, null, cacheDir)
-        try {
-            val (driveId, fileId) = getDriveIdAndFileId(documentId)
-            val getDownloadUrlResponse =
-                client.getDownloadUrl(authorization, driveId, fileId).get()
 
-            downloadFile(getDownloadUrlResponse.url, tempFile)
-            return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        } catch (e: Exception) {
-            Log.e("AliyunpanProvider", "Failed to open document $documentId", e)
-            throw e
+        if (tempFile.length() == 0L) {
+            try {
+                val (driveId, fileId) = getDriveIdAndFileId(documentId)
+                val getDownloadUrlResponse =
+                    client.getDownloadUrl(authorization, driveId, fileId).get()
+
+                downloadFile(getDownloadUrlResponse.url, tempFile)
+            } catch (e: Exception) {
+                Log.e("AliyunpanProvider", "Failed to open document $documentId", e)
+                throw e
+            }
         }
+        return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 
     override fun openDocumentThumbnail(
