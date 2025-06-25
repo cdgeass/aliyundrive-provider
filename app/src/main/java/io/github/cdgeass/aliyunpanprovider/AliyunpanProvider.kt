@@ -13,12 +13,18 @@ import android.provider.DocumentsProvider
 import android.util.Log
 import androidx.core.content.edit
 import io.github.cdgeass.AliyunpanClient
+import io.github.cdgeass.model.CreateWithFoldersRequest
+import io.github.cdgeass.model.CreateWithFoldersResponse
 import io.github.cdgeass.model.FileItem
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okio.FileNotFoundException
 import java.io.File
+import java.io.IOException
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
+
 
 class AliyunpanProvider : DocumentsProvider() {
 
@@ -41,6 +47,8 @@ class AliyunpanProvider : DocumentsProvider() {
             DocumentsContract.Document.COLUMN_FLAGS,
             DocumentsContract.Document.COLUMN_SIZE
         )
+        private val UPLOAD_SESSION: ConcurrentHashMap<String, CreateWithFoldersResponse> =
+            ConcurrentHashMap()
     }
 
     private val sharedPreferences: SharedPreferences by lazy {
@@ -127,6 +135,10 @@ class AliyunpanProvider : DocumentsProvider() {
                     DocumentsContract.Document.MIME_TYPE_DIR
                 )
                 add(
+                    DocumentsContract.Document.COLUMN_FLAGS,
+                    DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
+                )
+                add(
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                     if (documentId == backupDriveId) "阿里云盘(备份盘)" else "阿里云盘(资源盘)"
                 )
@@ -198,15 +210,62 @@ class AliyunpanProvider : DocumentsProvider() {
         val cacheDir = context?.cacheDir
         val tempFile = File.createTempFile(documentId!!, null, cacheDir)
 
-        if (tempFile.length() == 0L) {
+        val accessMode = ParcelFileDescriptor.parseMode(mode)
+        if ((accessMode and ParcelFileDescriptor.MODE_WRITE_ONLY) == 0) {
+            // read file
+            if (tempFile.length() == 0L) {
+                try {
+                    val (driveId, fileId) = getDriveIdAndFileId(documentId)
+                    val getDownloadUrlResponse =
+                        client.getDownloadUrl(authorization, driveId, fileId).get()
+
+                    downloadFile(getDownloadUrlResponse.url, tempFile)
+                } catch (e: Exception) {
+                    Log.e("AliyunpanProvider", "Failed to open document $documentId", e)
+                    throw e
+                }
+            }
+        } else {
+            // write file
             try {
                 val (driveId, fileId) = getDriveIdAndFileId(documentId)
-                val getDownloadUrlResponse =
-                    client.getDownloadUrl(authorization, driveId, fileId).get()
+                val createWithFoldersResponse = UPLOAD_SESSION[documentId]!!
 
-                downloadFile(getDownloadUrlResponse.url, tempFile)
+                val pipes = ParcelFileDescriptor.createPipe()
+                val readPipe = pipes[0]
+                val writePipe = pipes[1]
+
+                Thread(Runnable {
+                    try {
+                        ParcelFileDescriptor.AutoCloseInputStream(readPipe).use { inputStream ->
+                            val bytes = inputStream.readBytes()
+
+                            val request = Request.Builder()
+                                .url(createWithFoldersResponse.partInfoList[0].uploadUrl)
+                                .header("Content-Length", "${bytes.size}")
+                                .put(bytes.toRequestBody(null, 0, bytes.size))
+                                .build()
+                            val response = OkHttpClient().newCall(request).execute()
+
+                            if (!response.isSuccessful) {
+                                throw IOException("Failed to upload document $documentId")
+                            }
+
+                            client.completeFile(
+                                authorization,
+                                driveId,
+                                createWithFoldersResponse.uploadId,
+                                fileId,
+                            ).get()
+                        }
+                    } catch (e: IOException) {
+                        Log.e("MyCloudProvider", "Error during upload streaming", e)
+                    }
+                }).start()
+
+                return writePipe
             } catch (e: Exception) {
-                Log.e("AliyunpanProvider", "Failed to open document $documentId", e)
+                Log.e("AliyunpanProvider", "Failed to write document $documentId", e)
                 throw e
             }
         }
@@ -236,6 +295,34 @@ class AliyunpanProvider : DocumentsProvider() {
         }
         val pfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
         return AssetFileDescriptor(pfd, 0, tempFile.length())
+    }
+
+    override fun createDocument(
+        parentDocumentId: String?,
+        mimeType: String?,
+        displayName: String?
+    ): String? {
+        var (driveId, parentFileId) = getDriveIdAndFileId(parentDocumentId)
+        parentFileId = parentFileId ?: "root"
+
+        val createFileRequest = CreateWithFoldersRequest()
+        createFileRequest.driveId = driveId
+        createFileRequest.parentFileId = parentFileId
+        createFileRequest.name = displayName
+        createFileRequest.type = "file"
+        createFileRequest.createScene = "overwrite"
+
+        try {
+            val createFileResponse =
+                client.createWithFolders(authorization, createFileRequest).get()
+
+            val documentId = "$driveId-${createFileResponse.fileId}"
+            UPLOAD_SESSION[documentId] = createFileResponse
+            return documentId
+        } catch (e: Exception) {
+            Log.e("AliyunpanProvider", "Failed to create document", e)
+            throw e
+        }
     }
 
     private fun getDriveIdAndFileId(documentId: String?): Pair<String?, String?> {
