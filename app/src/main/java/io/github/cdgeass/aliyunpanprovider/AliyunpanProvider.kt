@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap
 class AliyunpanProvider : DocumentsProvider() {
 
     companion object {
+        private const val AUTHORITY = "io.github.cdgeass.aliyunpanprovider.documents"
         private val DEFAULT_ROOT_PROJECTION: Array<String> = arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,
             DocumentsContract.Root.COLUMN_MIME_TYPES,
@@ -57,34 +58,52 @@ class AliyunpanProvider : DocumentsProvider() {
 
     private val client: AliyunpanClient = AliyunpanClient()
 
-    private val authorization: String?
+    private val refreshToken: String?
+        get() {
+            return sharedPreferences.getString("refreshToken", null)
+        }
+    private var authorization: String?
         get() {
             return sharedPreferences.getString("authorization", null)
         }
-    private var backupDriveId: String
         set(value) {
-            sharedPreferences.edit { putString("backupDriveId", value) }
+            sharedPreferences.edit { putString("authorization", value) }
         }
+    private var backupDriveId: String
         get() {
             return sharedPreferences.getString("backupDriveId", null) ?: ""
         }
-    private var resourceDriveId: String
         set(value) {
-            sharedPreferences.edit { putString("resourceDriveId", value) }
+            sharedPreferences.edit { putString("backupDriveId", value) }
         }
+    private var resourceDriveId: String
         get() {
             return sharedPreferences.getString("resourceDriveId", null) ?: ""
         }
+        set(value) {
+            sharedPreferences.edit { putString("resourceDriveId", value) }
+        }
 
     override fun onCreate(): Boolean {
-        val authorization = authorization ?: return false
+        if (authorization == null) {
+            if (refreshToken == null) {
+                return false
+            }
+            try {
+                val getAccessTokenResponse = client.getAccessToken(refreshToken).get()
+                authorization = getAccessTokenResponse.authorization
+            } catch (e: Exception) {
+                Log.e("AliyunpanProvider", "Failed to refresh token", e)
+                return false
+            }
+        }
 
         try {
             val getUserResponse = client.getUser(authorization).get()
             backupDriveId = getUserResponse.backupDriveId
             resourceDriveId = getUserResponse.resourceDriveId
         } catch (e: Exception) {
-            Log.e("AliyunpanProvider", "Failed to get authorization ${e.message}", e)
+            Log.e("AliyunpanProvider", "Failed to get user ${e.message}", e)
             return false
         }
 
@@ -136,7 +155,7 @@ class AliyunpanProvider : DocumentsProvider() {
                 )
                 add(
                     DocumentsContract.Document.COLUMN_FLAGS,
-                    DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
+                    DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
                 )
                 add(
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -191,13 +210,10 @@ class AliyunpanProvider : DocumentsProvider() {
         parentDocumentId: String?,
         documentId: String?
     ): Boolean {
-        if (parentDocumentId == null) {
-            return false
-        }
-        if (documentId == null) {
-            return true
-        }
-        return documentId.startsWith(parentDocumentId)
+        val (parentDriveId, _) = getDriveIdAndFileId(parentDocumentId)
+        val (driveId, _) = getDriveIdAndFileId(documentId)
+
+        return parentDriveId == driveId
     }
 
     override fun openDocument(
@@ -207,15 +223,16 @@ class AliyunpanProvider : DocumentsProvider() {
     ): ParcelFileDescriptor {
         Log.d("AliyunpanProvider", "openDocument: $documentId")
 
-        val cacheDir = context?.cacheDir
-        val tempFile = File.createTempFile(documentId!!, null, cacheDir)
+        val (driveId, fileId) = getDriveIdAndFileId(documentId)
 
         val accessMode = ParcelFileDescriptor.parseMode(mode)
         if ((accessMode and ParcelFileDescriptor.MODE_WRITE_ONLY) == 0) {
             // read file
+            val cacheDir = context?.cacheDir
+            val tempFile = File(cacheDir, "$fileId.tmp")
+
             if (tempFile.length() == 0L) {
                 try {
-                    val (driveId, fileId) = getDriveIdAndFileId(documentId)
                     val getDownloadUrlResponse =
                         client.getDownloadUrl(authorization, driveId, fileId).get()
 
@@ -228,7 +245,6 @@ class AliyunpanProvider : DocumentsProvider() {
         } else {
             // write file
             try {
-                val (driveId, fileId) = getDriveIdAndFileId(documentId)
                 val createWithFoldersResponse = UPLOAD_SESSION[documentId]!!
 
                 val pipes = ParcelFileDescriptor.createPipe()
@@ -257,9 +273,17 @@ class AliyunpanProvider : DocumentsProvider() {
                                 createWithFoldersResponse.uploadId,
                                 fileId,
                             ).get()
+
+                            context?.contentResolver?.notifyChange(
+                                DocumentsContract.buildDocumentUri(
+                                    AUTHORITY,
+                                    documentId
+                                ), null
+                            )
                         }
                     } catch (e: IOException) {
                         Log.e("MyCloudProvider", "Error during upload streaming", e)
+                        throw e
                     }
                 }).start()
 
@@ -279,22 +303,23 @@ class AliyunpanProvider : DocumentsProvider() {
     ): AssetFileDescriptor? {
         Log.d("AliyunpanProvider", "openDocumentThumbnail: $documentId")
 
-        val cacheDir = context?.cacheDir
-        val tempFile = File.createTempFile(documentId!!, ".thumbnail", cacheDir)
+        val (driveId, fileId) = getDriveIdAndFileId(documentId)
 
-        if (tempFile.length() == 0L) {
+        val cacheDir = context?.cacheDir
+        val thumbnail = File(cacheDir, "$fileId.thumbnail")
+
+        if (thumbnail.length() == 0L) {
             try {
-                val (driveId, fileId) = getDriveIdAndFileId(documentId)
                 val fileItem = client.getFile(authorization, driveId, fileId).get()
 
-                downloadFile(fileItem.thumbnail!!, tempFile)
+                downloadFile(fileItem.thumbnail!!, thumbnail)
             } catch (e: Exception) {
                 Log.e("AliyunpanProvider", "Failed to get thumbnail $documentId", e)
                 throw e
             }
         }
-        val pfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        return AssetFileDescriptor(pfd, 0, tempFile.length())
+        val pfd = ParcelFileDescriptor.open(thumbnail, ParcelFileDescriptor.MODE_READ_ONLY)
+        return AssetFileDescriptor(pfd, 0, thumbnail.length())
     }
 
     override fun createDocument(
@@ -325,6 +350,18 @@ class AliyunpanProvider : DocumentsProvider() {
         }
     }
 
+    override fun deleteDocument(documentId: String?) {
+        Log.d("AliyunpanProvider", "deleteDocument: $documentId")
+
+        val (driveId, fileId) = getDriveIdAndFileId(documentId)
+        try {
+            client.trashRecyclebin(authorization, driveId, fileId).get()
+        } catch (e: Exception) {
+            Log.e("AliyunpanProvider", "Failed to delete document", e)
+            throw e
+        }
+    }
+
     private fun getDriveIdAndFileId(documentId: String?): Pair<String?, String?> {
         if (documentId == null) {
             return Pair(null, null)
@@ -340,6 +377,7 @@ class AliyunpanProvider : DocumentsProvider() {
 
     private fun includeFile(result: MatrixCursor, fileItem: FileItem) {
         var flags = 0
+        flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
         if (fileItem.type == "folder") {
             flags = flags or DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
         }
