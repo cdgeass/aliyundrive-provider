@@ -186,7 +186,7 @@ class AliyunpanProvider : DocumentsProvider() {
             val (driveId, fileId) = getDriveIdAndFileId(parentDocumentId)
             var nextMarker: String? = null
             while (true) {
-                var listFileResponse =
+                val listFileResponse =
                     client.listFile(authorization, driveId, fileId, nextMarker)
                         .get()
 
@@ -242,6 +242,7 @@ class AliyunpanProvider : DocumentsProvider() {
                     throw e
                 }
             }
+            return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
         } else {
             // write file
             try {
@@ -251,7 +252,7 @@ class AliyunpanProvider : DocumentsProvider() {
                 val readPipe = pipes[0]
                 val writePipe = pipes[1]
 
-                Thread(Runnable {
+                Thread {
                     try {
                         ParcelFileDescriptor.AutoCloseInputStream(readPipe).use { inputStream ->
                             val bytes = inputStream.readBytes()
@@ -285,7 +286,7 @@ class AliyunpanProvider : DocumentsProvider() {
                         Log.e("MyCloudProvider", "Error during upload streaming", e)
                         throw e
                     }
-                }).start()
+                }.start()
 
                 return writePipe
             } catch (e: Exception) {
@@ -293,7 +294,6 @@ class AliyunpanProvider : DocumentsProvider() {
                 throw e
             }
         }
-        return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 
     override fun openDocumentThumbnail(
@@ -360,6 +360,27 @@ class AliyunpanProvider : DocumentsProvider() {
             Log.e("AliyunpanProvider", "Failed to delete document", e)
             throw e
         }
+    }
+
+    override fun querySearchDocuments(
+        rootId: String?,
+        query: String?,
+        projection: Array<out String?>?
+    ): Cursor? {
+        Log.d("AliyunpanProvider", "querySearchDocument: $rootId $query")
+        val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
+
+        val driveId = if (rootId == "backup") backupDriveId else resourceDriveId
+        try {
+            val searchFileResponse = client.searchFile(authorization, listOf(driveId), query).get()
+            searchFileResponse.items.forEach {
+                includeFile(result, it)
+            }
+        } catch (e: Exception) {
+            Log.e("AliyunpanProvider", "Failed to search file", e)
+        }
+
+        return result
     }
 
     private fun getDriveIdAndFileId(documentId: String?): Pair<String?, String?> {
