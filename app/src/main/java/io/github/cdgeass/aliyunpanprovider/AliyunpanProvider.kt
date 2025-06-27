@@ -1,21 +1,30 @@
 package io.github.cdgeass.aliyunpanprovider
 
-import android.content.Context.MODE_PRIVATE
+import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.graphics.Point
+import android.net.Uri
+import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
+import android.security.keystore.UserNotAuthenticatedException
 import android.util.Log
 import androidx.core.content.edit
 import io.github.cdgeass.AliyunpanClient
 import io.github.cdgeass.model.CreateWithFoldersRequest
 import io.github.cdgeass.model.CreateWithFoldersResponse
 import io.github.cdgeass.model.FileItem
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -53,37 +62,59 @@ class AliyunpanProvider : DocumentsProvider() {
             ConcurrentHashMap()
     }
 
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val client: AliyunpanClient = AliyunpanClient()
+    private val directoryCache: ConcurrentHashMap<Uri, List<FileItem>> = ConcurrentHashMap()
 
     private val sharedPreferences: SharedPreferences by lazy {
-        context!!.getSharedPreferences(TAG, MODE_PRIVATE)
+        context!!.getSharedPreferences(TAG, Context.MODE_PRIVATE)
     }
-
     private val refreshToken: String?
         get() {
             return sharedPreferences.getString("refreshToken", null)
         }
-    private var authorization: String?
+    private val authorization: String?
         get() {
             return sharedPreferences.getString("authorization", null)
         }
-        set(value) {
-            sharedPreferences.edit { putString("authorization", value) }
-        }
-    private var backupDriveId: String
+
+    private var backupDriveId: String?
         get() {
-            return sharedPreferences.getString("backupDriveId", null) ?: ""
+            return sharedPreferences.getString("backupDriveId", null)
         }
         set(value) {
             sharedPreferences.edit { putString("backupDriveId", value) }
         }
-    private var resourceDriveId: String
+    private var resourceDriveId: String?
         get() {
-            return sharedPreferences.getString("resourceDriveId", null) ?: ""
+            return sharedPreferences.getString("resourceDriveId", null)
         }
         set(value) {
             sharedPreferences.edit { putString("resourceDriveId", value) }
         }
+
+    private suspend fun getAuthorization(): String {
+        if (refreshToken == null) {
+            throw UserNotAuthenticatedException()
+        }
+
+        var authorization = sharedPreferences.getString("authorization", null)
+        var expiredAt = sharedPreferences.getLong("expiredAt", 0L)
+        if (authorization != null && System.currentTimeMillis() < expiredAt) {
+            return authorization
+        }
+
+        val response = client.getAccessToken(refreshToken).await()
+        authorization = response.authorization
+        expiredAt = System.currentTimeMillis() + response.expiresIn() * 1000
+
+        sharedPreferences.edit {
+            putString("authorization", authorization)
+            putLong("expiredAt", expiredAt)
+        }
+
+        return authorization
+    }
 
     override fun onCreate(): Boolean {
         return refreshToken != null
@@ -92,51 +123,51 @@ class AliyunpanProvider : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
 
-        if (authorization == null) {
-            if (refreshToken == null) {
-                return result
+        if (backupDriveId == null || resourceDriveId == null) {
+            val uri = DocumentsContract.buildRootsUri(AUTHORITY)
+            result.apply {
+                extras = Bundle().apply {
+                    putBoolean(DocumentsContract.EXTRA_LOADING, true)
+                }
+                setNotificationUri(context?.contentResolver, uri)
+            }.also {
+                applicationScope.launch {
+                    try {
+                        val response = client.getUser(getAuthorization()).await()
+                        backupDriveId = response.backupDriveId
+                        resourceDriveId = response.resourceDriveId
+
+                        context?.contentResolver?.notifyChange(uri, null, 0)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to get user ${e.message}", e)
+                    }
+                }
             }
-            try {
-                val getAccessTokenResponse = client.getAccessToken(refreshToken).get()
-                authorization = getAccessTokenResponse.authorization
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to refresh token", e)
-                return result
+        } else {
+            result.newRow().apply {
+                add(DocumentsContract.Root.COLUMN_ROOT_ID, "backup")
+                add(DocumentsContract.Root.COLUMN_TITLE, "阿里云盘(备份盘)")
+                add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, backupDriveId)
+                add(
+                    DocumentsContract.Root.COLUMN_FLAGS,
+                    DocumentsContract.Root.FLAG_SUPPORTS_CREATE
+                            or DocumentsContract.Root.FLAG_SUPPORTS_SEARCH
+                            or DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD
+                )
+                add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
             }
-        }
-
-        try {
-            val getUserResponse = client.getUser(authorization).get()
-            backupDriveId = getUserResponse.backupDriveId
-            resourceDriveId = getUserResponse.resourceDriveId
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get user ${e.message}", e)
-            return result
-        }
-
-        Log.d(
-            TAG, "onCreate backupDriveId: $backupDriveId; resourceDriveId: $resourceDriveId"
-        )
-
-        result.newRow().apply {
-            add(DocumentsContract.Root.COLUMN_ROOT_ID, "backup")
-            add(DocumentsContract.Root.COLUMN_TITLE, "阿里云盘(备份盘)")
-            add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, backupDriveId)
-            add(
-                DocumentsContract.Root.COLUMN_FLAGS,
-                DocumentsContract.Root.FLAG_SUPPORTS_CREATE or DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD
-            )
-            add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
-        }
-        result.newRow().apply {
-            add(DocumentsContract.Root.COLUMN_ROOT_ID, "resource")
-            add(DocumentsContract.Root.COLUMN_TITLE, "阿里云盘(资源盘)")
-            add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, resourceDriveId)
-            add(
-                DocumentsContract.Root.COLUMN_FLAGS,
-                DocumentsContract.Root.FLAG_SUPPORTS_CREATE or DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD
-            )
-            add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
+            result.newRow().apply {
+                add(DocumentsContract.Root.COLUMN_ROOT_ID, "resource")
+                add(DocumentsContract.Root.COLUMN_TITLE, "阿里云盘(资源盘)")
+                add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, resourceDriveId)
+                add(
+                    DocumentsContract.Root.COLUMN_FLAGS,
+                    DocumentsContract.Root.FLAG_SUPPORTS_CREATE
+                            or DocumentsContract.Root.FLAG_SUPPORTS_SEARCH
+                            or DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD
+                )
+                add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
+            }
         }
 
         return result
@@ -180,26 +211,50 @@ class AliyunpanProvider : DocumentsProvider() {
         parentDocumentId: String?, projection: Array<out String>?, sortOrder: String?
     ): Cursor {
         Log.d(TAG, "queryChildDocument $parentDocumentId")
+
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
 
-        try {
-            val (driveId, _, fileId) = getDriveIdAndFileId(parentDocumentId)
-            var nextMarker: String? = null
-            while (true) {
-                val listFileResponse =
-                    client.listFile(authorization, driveId, fileId, nextMarker).get()
+        val (driveId, _, fileId) = getDriveIdAndFileId(parentDocumentId)
+        val uri = DocumentsContract.buildDocumentUri(AUTHORITY, parentDocumentId)
 
-                listFileResponse.items.forEach { item ->
-                    includeFile(result, parentDocumentId, item)
+        val fileItems = directoryCache.get(uri)
+        if (fileItems == null) {
+            result.apply {
+                extras = Bundle().apply {
+                    putBoolean(DocumentsContract.EXTRA_LOADING, true)
                 }
+                setNotificationUri(context?.contentResolver, uri)
+            }.also {
+                applicationScope.launch {
+                    try {
+                        val authorization = getAuthorization()
+                        val fileItems = mutableListOf<FileItem>()
+                        var nextMarker: String? = null
 
-                nextMarker = listFileResponse.nextMarker
-                if (nextMarker.isEmpty()) {
-                    break
+                        while (true) {
+                            val listFileResponse = client.listFile(
+                                authorization, driveId, fileId, nextMarker
+                            ).await()
+
+                            fileItems.addAll(listFileResponse.items)
+
+                            nextMarker = listFileResponse.nextMarker
+                            if (nextMarker.isEmpty()) {
+                                break
+                            }
+                        }
+
+                        directoryCache.put(uri, fileItems)
+                        context?.contentResolver?.notifyChange(uri, null, 0)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to list file", e)
+                    }
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to list file", e)
+        } else {
+            fileItems.forEach {
+                includeFile(result, parentDocumentId, it)
+            }
         }
 
         return result
@@ -216,48 +271,43 @@ class AliyunpanProvider : DocumentsProvider() {
     ): ParcelFileDescriptor {
         Log.d(TAG, "openDocument: $documentId")
 
-        val (driveId, _, fileId) = getDriveIdAndFileId(documentId)
+        val (driveId, parentDocumentId, fileId) = getDriveIdAndFileId(documentId)
 
         val accessMode = ParcelFileDescriptor.parseMode(mode)
         if ((accessMode and ParcelFileDescriptor.MODE_WRITE_ONLY) == 0) {
             // read file
-            val cacheDir = context?.cacheDir
-            val tempFile = File(cacheDir, "$documentId.tmp")
+            val temp = File(context?.cacheDir, "$documentId.tmp")
 
-            if (!tempFile.exists()) {
+            if (!temp.exists()) {
                 try {
-                    tempFile.parentFile?.mkdirs()
-                    if (tempFile.createNewFile()) {
-                        val getDownloadUrlResponse =
-                            client.getDownloadUrl(authorization, driveId, fileId).get()
+                    temp.parentFile?.mkdirs()
+                    temp.createNewFile()
 
-                        downloadFile(getDownloadUrlResponse.url, tempFile)
-                    }
+                    val response = client.getDownloadUrl(authorization, driveId, fileId).get()
+                    downloadFile(response.url, temp)
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to open document $documentId", e)
                     throw e
                 }
             }
-            return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            return ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY)
         } else {
             // write file
             val createWithFoldersResponse = UPLOAD_SESSION[documentId]!!
 
-            val pipes = ParcelFileDescriptor.createPipe()
-            val readPipe = pipes[0]
-            val writePipe = pipes[1]
-
-            Thread {
+            val (readPipe, writePipe) = ParcelFileDescriptor.createPipe()
+            applicationScope.launch {
                 try {
                     ParcelFileDescriptor.AutoCloseInputStream(readPipe).use { inputStream ->
                         val bytes = inputStream.readBytes()
 
-                        val request =
-                            Request.Builder()
-                                .url(createWithFoldersResponse.partInfoList[0].uploadUrl)
-                                .header("Content-Length", "${bytes.size}")
-                                .put(bytes.toRequestBody(null, 0, bytes.size)).build()
-                        val response = OkHttpClient().newCall(request).execute()
+                        val request = Request.Builder()
+                            .url(createWithFoldersResponse.partInfoList[0].uploadUrl)
+                            .header("Content-Length", "${bytes.size}")
+                            .put(bytes.toRequestBody(null, 0, bytes.size)).build()
+                        val response = withContext(Dispatchers.IO) {
+                            OkHttpClient().newCall(request).execute()
+                        }
 
                         if (!response.isSuccessful) {
                             throw IOException("Failed to upload document $documentId")
@@ -267,20 +317,18 @@ class AliyunpanProvider : DocumentsProvider() {
                             authorization,
                             driveId,
                             createWithFoldersResponse.uploadId,
-                            fileId,
-                        ).get()
+                            fileId
+                        ).await()
 
-                        context?.contentResolver?.notifyChange(
-                            DocumentsContract.buildDocumentUri(
-                                AUTHORITY, documentId
-                            ), null
-                        )
+                        val uri = DocumentsContract.buildDocumentUri(AUTHORITY, parentDocumentId)
+                        directoryCache.remove(uri)
+                        context?.contentResolver?.notifyChange(uri, null, 0)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to write document $documentId", e)
                     throw e
                 }
-            }.start()
+            }
 
             return writePipe
         }
@@ -299,11 +347,10 @@ class AliyunpanProvider : DocumentsProvider() {
         if (!thumbnail.exists()) {
             try {
                 thumbnail.parentFile?.mkdirs()
-                if (thumbnail.createNewFile()) {
+                thumbnail.createNewFile()
 
-                    val fileItem = client.getFile(authorization, driveId, fileId).get()
-                    downloadFile(fileItem.thumbnail!!, thumbnail)
-                }
+                val fileItem = client.getFile(authorization, driveId, fileId).get()
+                downloadFile(fileItem.thumbnail, thumbnail)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to get thumbnail $documentId", e)
                 throw e
@@ -320,18 +367,20 @@ class AliyunpanProvider : DocumentsProvider() {
 
         val (driveId, _, parentFileId) = getDriveIdAndFileId(parentDocumentId)
 
-        val createFileRequest = CreateWithFoldersRequest()
-        createFileRequest.driveId = driveId
-        createFileRequest.parentFileId = parentFileId ?: "root"
-        createFileRequest.name = displayName
-        createFileRequest.type = "file"
-        createFileRequest.createScene = "overwrite"
+        val createFileRequest = CreateWithFoldersRequest().apply {
+            this.driveId = driveId
+            this.parentFileId = parentFileId ?: "root"
+            name = displayName
+            type = "file"
+            createScene = "overwrite"
+        }
 
         try {
-            val createFileResponse =
-                client.createWithFolders(authorization, createFileRequest).get()
-            val documentId = "$parentDocumentId/${createFileResponse.fileId}"
-            UPLOAD_SESSION[documentId] = createFileResponse
+            val response = client.createWithFolders(authorization, createFileRequest).get()
+
+            val documentId = "$parentDocumentId/${response.fileId}"
+            UPLOAD_SESSION[documentId] = response
+
             return documentId
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create document", e)
@@ -342,9 +391,13 @@ class AliyunpanProvider : DocumentsProvider() {
     override fun deleteDocument(documentId: String?) {
         Log.d(TAG, "deleteDocument: $documentId")
 
-        val (driveId, _, fileId) = getDriveIdAndFileId(documentId)
+        val (driveId, parentDocumentId, fileId) = getDriveIdAndFileId(documentId)
         try {
             client.trashRecyclebin(authorization, driveId, fileId).get()
+
+            val uri = DocumentsContract.buildDocumentUri(AUTHORITY, parentDocumentId)
+            directoryCache.remove(uri)
+            context?.contentResolver?.notifyChange(uri, null, 0)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to delete document", e)
             throw e
@@ -413,7 +466,7 @@ class AliyunpanProvider : DocumentsProvider() {
         }
     }
 
-    private fun downloadFile(downloadUrl: String, tempFile: File) {
+    private fun downloadFile(downloadUrl: String, file: File) {
         val response = OkHttpClient().newCall(
             Request.Builder().url(downloadUrl).addHeader("Referer", "https://www.alipan.com/")
                 .build()
@@ -421,7 +474,7 @@ class AliyunpanProvider : DocumentsProvider() {
 
         if (response.isSuccessful) {
             response.body?.byteStream()?.use { inputStream ->
-                tempFile.outputStream().use { outputStream ->
+                file.outputStream().use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
             }

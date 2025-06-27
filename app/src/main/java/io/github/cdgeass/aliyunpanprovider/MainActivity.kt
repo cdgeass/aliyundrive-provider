@@ -2,6 +2,7 @@ package io.github.cdgeass.aliyunpanprovider
 
 import android.app.Application
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -36,9 +37,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import io.github.cdgeass.AliyunpanClient
 import io.github.cdgeass.aliyunpanprovider.ui.theme.AliyunpanProviderTheme
 import io.github.cdgeass.model.GetUserResponse
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 sealed class UiState {
     object Initial : UiState()
@@ -47,9 +47,26 @@ sealed class UiState {
     data class Error(val message: String) : UiState()
 }
 
+private const val TAG = "AliyunpanProvider"
+
 class MyViewModel(
     private val application: Application
 ) : ViewModel() {
+
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                val application = this[APPLICATION_KEY] as Application
+                MyViewModel(application)
+            }
+        }
+    }
+
+    private val client = AliyunpanClient()
+    private val sharedPreferences: SharedPreferences by lazy {
+        application.getSharedPreferences(TAG, Context.MODE_PRIVATE)
+    }
+
     private val _refreshToken = mutableStateOf<String?>(null)
     val refreshToken: String?
         get() = _refreshToken.value
@@ -62,101 +79,104 @@ class MyViewModel(
     val user: GetUserResponse?
         get() = _user.value
 
-    private val client = AliyunpanClient()
 
     init {
-        _refreshToken.value = loadRefreshToken()
-        val authorization = loadAuthorization()
-        if (_refreshToken.value != null && authorization != null) {
-            _uiState.value = UiState.Verified
-            viewModelScope.launch {
-                loadUserInfo()
-            }
-        } else {
+        val refreshToken = sharedPreferences.getString("refreshToken", null)
+        if (refreshToken == null) {
             _uiState.value = UiState.Initial
-        }
-    }
+        } else {
+            _refreshToken.value = refreshToken
 
-    companion object {
-        val Factory: ViewModelProvider.Factory = viewModelFactory {
-            initializer {
-                val application = this[APPLICATION_KEY] as Application
-                MyViewModel(application)
+            var (authorization, expiredAt) = readAuthorization()
+            if (authorization != null && System.currentTimeMillis() < expiredAt) {
+                _uiState.value = UiState.Verified
+
+                viewModelScope.launch {
+                    try {
+                        val user = getUser(authorization)
+
+                        _user.value = user
+                        _uiState.value = UiState.Authorized
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to init", e)
+                        _uiState.value = UiState.Error(e.message ?: "Unknown error")
+                    }
+                }
+            } else {
+                viewModelScope.launch {
+                    try {
+                        val (authorization, expiredAt) = getAuthorization(refreshToken)
+
+                        val user = getUser(authorization)
+
+                        _user.value = user
+                        _uiState.value = UiState.Authorized
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to init", e)
+                        _uiState.value = UiState.Error(e.message ?: "Unknown error")
+                    }
+                }
             }
         }
     }
 
-    fun loadRefreshToken(): String? {
-        return application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE)
-            .getString(
-                "refreshToken",
-                null
-            )
+    fun readAuthorization(): Pair<String?, Long> {
+        val authorization = sharedPreferences.getString("authorization", null)
+        val expiredAt = sharedPreferences.getLong("expiredAt", 0L)
+        return Pair(authorization, expiredAt)
     }
 
-    fun loadAuthorization(): String? {
-        return application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE)
-            .getString(
-                "authorization",
-                null
-            )
+    suspend fun getAuthorization(refreshToken: String): Pair<String, Long> {
+        try {
+            val response = client.getAccessToken(refreshToken).await()
+
+            val authorization = response.authorization
+            val expiredAt = System.currentTimeMillis() + response.expiresIn() * 1000
+
+            return Pair(authorization, expiredAt)
+        } catch (e: Exception) {
+            Log.d(TAG, "Failed to get authorization", e)
+            throw e
+        }
+    }
+
+    suspend fun getUser(authorization: String): GetUserResponse {
+        try {
+            return client.getUser(authorization).await()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get user", e)
+            throw e
+        }
     }
 
     suspend fun updateRefreshToken(refreshToken: String) {
         try {
-            val getAccessTokenFuture = client.getAccessToken(refreshToken)
-            val getAccessTokenResponse = withContext(Dispatchers.IO) {
-                getAccessTokenFuture.get()
+            val (authorization, _) = getAuthorization(refreshToken)
+            sharedPreferences.edit {
+                putString("refreshToken", refreshToken)
             }
-            val authorization = getAccessTokenResponse.authorization
 
-            application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE).edit {
-                putString(
-                    "refreshToken",
-                    refreshToken
-                )
-                putString(
-                    "authorization",
-                    authorization
-                )
-            }
             _refreshToken.value = refreshToken
             _uiState.value = UiState.Verified
-            loadUserInfo()
+
+            val user = getUser(authorization)
+            _user.value = user
+            _uiState.value = UiState.Authorized
         } catch (e: Exception) {
-            Log.e("AliyunpanProvider", "setRefreshToken", e)
+            Log.e(TAG, "Failed to update refreshToken", e)
             _uiState.value = UiState.Error(e.message ?: "Unknown error")
         }
     }
 
     fun clearRefreshToken() {
-        application.getSharedPreferences("AliyunpanProvider", Context.MODE_PRIVATE).edit {
+        sharedPreferences.edit {
             remove("refreshToken")
             remove("authorization")
+            remove("expiredAt")
         }
         _refreshToken.value = null
         _uiState.value = UiState.Initial
         _user.value = null
-    }
-
-    suspend fun loadUserInfo() {
-        val authorization = loadAuthorization()
-        if (authorization != null) {
-            try {
-                val getUserFuture = client.getUser(authorization)
-                val userInfoResponse = withContext(Dispatchers.IO) {
-                    getUserFuture.get()
-                }
-                _user.value = userInfoResponse
-                _uiState.value = UiState.Authorized
-            } catch (e: Exception) {
-                Log.e("AliyunpanProvider", "getUserInfo", e)
-                _uiState.value = UiState.Error(e.message ?: "Unknown error")
-                clearRefreshToken() // Clear token if user info fetch fails
-            }
-        } else {
-            _uiState.value = UiState.Initial
-        }
     }
 }
 
