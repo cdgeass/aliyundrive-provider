@@ -9,7 +9,11 @@ import android.graphics.Point
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.ProxyFileDescriptorCallback
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import android.security.keystore.UserNotAuthenticatedException
@@ -28,8 +32,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.FileNotFoundException
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -65,6 +69,17 @@ class AliyunpanProvider : DocumentsProvider() {
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val client: AliyunpanClient = AliyunpanClient()
     private val directoryCache: ConcurrentHashMap<Uri, List<FileItem>> = ConcurrentHashMap()
+
+    private val storageManager: StorageManager by lazy {
+        context!!.getSystemService(Context.STORAGE_SERVICE) as StorageManager
+    }
+    private val fileHandler = lazy {
+        Handler(
+            HandlerThread(this.javaClass.simpleName)
+                .apply { start() }
+                .looper
+        )
+    }
 
     private val sharedPreferences: SharedPreferences by lazy {
         context!!.getSharedPreferences(TAG, Context.MODE_PRIVATE)
@@ -217,7 +232,7 @@ class AliyunpanProvider : DocumentsProvider() {
         val (driveId, _, fileId) = getDriveIdAndFileId(parentDocumentId)
         val uri = DocumentsContract.buildDocumentUri(AUTHORITY, parentDocumentId)
 
-        val fileItems = directoryCache.get(uri)
+        val fileItems = directoryCache[uri]
         if (fileItems == null) {
             result.apply {
                 extras = Bundle().apply {
@@ -276,21 +291,69 @@ class AliyunpanProvider : DocumentsProvider() {
         val accessMode = ParcelFileDescriptor.parseMode(mode)
         if ((accessMode and ParcelFileDescriptor.MODE_WRITE_ONLY) == 0) {
             // read file
-            val temp = File(context?.cacheDir, "$documentId.tmp")
+            try {
+                val getDownloadUrlResponse = client.getDownloadUrl(
+                    authorization, driveId, fileId
+                ).get()
+                val url = getDownloadUrlResponse.url
+                val size = getDownloadUrlResponse.size
 
-            if (!temp.exists()) {
-                try {
-                    temp.parentFile?.mkdirs()
-                    temp.createNewFile()
+                return storageManager.openProxyFileDescriptor(
+                    ParcelFileDescriptor.parseMode(mode),
+                    object : ProxyFileDescriptorCallback() {
+                        override fun onGetSize(): Long {
+                            return size
+                        }
 
-                    val response = client.getDownloadUrl(authorization, driveId, fileId).get()
-                    downloadFile(response.url, temp)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to open document $documentId", e)
-                    throw e
-                }
+                        override fun onRead(
+                            offset: Long,
+                            size: Int,
+                            data: ByteArray?
+                        ): Int {
+                            Log.d(TAG, "Open document end $documentId $offset-$size")
+                            try {
+                                val response = OkHttpClient().newCall(
+                                    Request.Builder()
+                                        .url(url)
+                                        .addHeader("Range", "bytes=$offset-${offset + size - 1}")
+                                        .build()
+                                ).execute()
+                                if (!response.isSuccessful) {
+                                    throw FileNotFoundException("Failed to open file ${response.body?.string()}")
+                                }
+
+                                var bytesRead = 0
+                                response.body?.use { body ->
+                                    body.byteStream().use { inputStream ->
+                                        while (bytesRead < size) {
+                                            val offset = inputStream.read(
+                                                data, bytesRead, size - bytesRead
+                                            )
+                                            if (offset == -1) {
+                                                break
+                                            }
+                                            bytesRead += offset
+                                        }
+                                    }
+                                }
+
+                                return bytesRead
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to openDocument $documentId $offset-$size")
+                                throw e
+                            }
+                        }
+
+                        override fun onRelease() {
+                            Log.d(TAG, "Open document end $documentId")
+                        }
+                    },
+                    fileHandler.value
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to open document $documentId", e)
+                throw e
             }
-            return ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY)
         } else {
             // write file
             val createWithFoldersResponse = UPLOAD_SESSION[documentId]!!
@@ -345,15 +408,19 @@ class AliyunpanProvider : DocumentsProvider() {
         val thumbnail = File(cacheDir, "$documentId.thumbnail")
 
         if (!thumbnail.exists()) {
-            try {
-                thumbnail.parentFile?.mkdirs()
-                thumbnail.createNewFile()
+            applicationScope.launch {
+                try {
+                    thumbnail.parentFile?.mkdirs()
+                    thumbnail.createNewFile()
 
-                val fileItem = client.getFile(authorization, driveId, fileId).get()
-                downloadFile(fileItem.thumbnail, thumbnail)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to get thumbnail $documentId", e)
-                throw e
+                    val fileItem = client.getFile(authorization, driveId, fileId).await()
+                    withContext(Dispatchers.IO) {
+                        downloadFile(fileItem.thumbnail, thumbnail)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to get thumbnail $documentId", e)
+                    throw e
+                }
             }
         }
         val pfd = ParcelFileDescriptor.open(thumbnail, ParcelFileDescriptor.MODE_READ_ONLY)
@@ -468,7 +535,9 @@ class AliyunpanProvider : DocumentsProvider() {
 
     private fun downloadFile(downloadUrl: String, file: File) {
         val response = OkHttpClient().newCall(
-            Request.Builder().url(downloadUrl).addHeader("Referer", "https://www.alipan.com/")
+            Request.Builder()
+                .url(downloadUrl)
+                .addHeader("Referer", "https://www.alipan.com/")
                 .build()
         ).execute()
 
