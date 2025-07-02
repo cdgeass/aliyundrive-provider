@@ -1,4 +1,4 @@
-package io.github.cdgeass.aliyunpanprovider
+package io.github.cdgeass.aliyundriveprovider
 
 import org.junit.Test
 

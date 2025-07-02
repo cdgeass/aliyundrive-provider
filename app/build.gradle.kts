@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "io.github.cdgeass.aliyunpanprovider"
+    namespace = "io.github.cdgeass.aliyundriveprovider"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "io.github.cdgeass.aliyunpanprovider"
+        applicationId = "io.github.cdgeass.aliyundriveprovider"
         minSdk = 32
         targetSdk = 35
         versionCode = 1
@@ -57,7 +57,7 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 
-    implementation(files("libs/aliyunpan-api.jar"))
+    implementation(files("libs/aliyundrive-api.jar"))
     implementation(libs.okhttp)
     implementation(libs.gson)
 }

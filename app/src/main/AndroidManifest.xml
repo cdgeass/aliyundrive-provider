@@ -13,11 +13,11 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AliyunpanProvider">
+        android:theme="@style/Theme.AliyundriveProvider">
         <activity
-            android:name=".MainActivity"
+            android:name="io.github.cdgeass.aliyundriveprovider.MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.AliyunpanProvider">
+            android:theme="@style/Theme.AliyundriveProvider">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
@@ -25,8 +25,8 @@
             </intent-filter>
         </activity>
         <provider
-            android:name="io.github.cdgeass.aliyunpanprovider.AliyunpanProvider"
-            android:authorities="io.github.cdgeass.aliyunpanprovider.documents"
+            android:name="io.github.cdgeass.aliyundriveprovider.AliyundriveProvider"
+            android:authorities="io.github.cdgeass.aliyundriveprovider.documents"
             android:grantUriPermissions="true"
             android:exported="true"
             android:permission="android.permission.MANAGE_DOCUMENTS">

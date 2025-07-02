@@ -1,4 +1,4 @@
-package io.github.cdgeass.aliyunpanprovider
+package io.github.cdgeass.aliyundriveprovider
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -39,11 +39,11 @@ import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 
-class AliyunpanProvider : DocumentsProvider() {
+class AliyundriveProvider : DocumentsProvider() {
 
     companion object {
-        private const val TAG = "AliyunpanProvider"
-        private const val AUTHORITY = "io.github.cdgeass.aliyunpanprovider.documents"
+        private const val TAG = "AliyundriveProvider"
+        private const val AUTHORITY = "io.github.cdgeass.aliyundriveprovider.documents"
         private val DEFAULT_ROOT_PROJECTION: Array<String> = arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,
             DocumentsContract.Root.COLUMN_MIME_TYPES,

@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Aliyunpan Provider"
+rootProject.name = "Aliyundrive Provider"
 include(":app")

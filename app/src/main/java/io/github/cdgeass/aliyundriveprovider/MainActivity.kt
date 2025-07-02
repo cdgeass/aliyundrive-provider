@@ -1,4 +1,4 @@
-package io.github.cdgeass.aliyunpanprovider
+package io.github.cdgeass.aliyundriveprovider
 
 import android.app.Application
 import android.content.Context
@@ -35,7 +35,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import io.github.cdgeass.AliyunpanClient
-import io.github.cdgeass.aliyunpanprovider.ui.theme.AliyunpanProviderTheme
+import io.github.cdgeass.aliyundriveprovider.ui.theme.AliyundriveProviderTheme
 import io.github.cdgeass.model.GetUserResponse
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
@@ -47,7 +47,7 @@ sealed class UiState {
     data class Error(val message: String) : UiState()
 }
 
-private const val TAG = "AliyunpanProvider"
+private const val TAG = "AliyundriveProvider"
 
 class MyViewModel(
     private val application: Application
@@ -188,13 +188,13 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val viewModel = ViewModelProvider(this, MyViewModel.Factory)[MyViewModel::class.java]
         setContent {
-            AliyunpanProviderTheme {
+            AliyundriveProviderTheme {
                 Scaffold(
                     modifier = Modifier.fillMaxSize(),
                     topBar = {
                         TopAppBar(
                             title = {
-                                Text("Aliyunpan Provider")
+                                Text("Aliyundrive Provider")
                             }
                         )
                     }

@@ -1,4 +1,4 @@
-package io.github.cdgeass.aliyunpanprovider.ui.theme
+package io.github.cdgeass.aliyundriveprovider.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
